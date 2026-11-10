@@ -122,9 +122,25 @@ fn find_cpu_temp_file(temp_buf: &mut String) -> Result<std::fs::File> {
     find_temp_file(temps, temp_buf).ok_or(Error::NoCpu)
 }
 
-fn find_gpu_temp_file(temp_buf: &mut String) -> Result<Option<std::fs::File>> {
-    let temps = glob::glob("/sys/class/drm/card0/device/hwmon/hwmon*/temp1_input")?;
-    Ok(find_temp_file(temps, temp_buf))
+fn find_gpu_temp_files(temp_buf: &mut String) -> Result<Vec<std::fs::File>> {
+    let mut files = Vec::new();
+    for temp_path_res in glob::glob("/sys/class/drm/card*/device/hwmon/hwmon*/temp1_input")? {
+        let Ok(temp_path) = temp_path_res else {
+            eprintln!("Unable to read glob path");
+            continue;
+        };
+
+        let Ok(mut temp_file) = std::fs::File::open(&temp_path) else {
+            eprintln!("Unable to open temperature sensor");
+            continue;
+        };
+
+        if read_temp_file(&mut temp_file, temp_buf).is_ok() {
+            files.push(temp_file);
+        }
+    }
+
+    Ok(files)
 }
 
 fn main() -> ExitCode {
@@ -140,7 +156,7 @@ fn main() -> ExitCode {
 fn start_temp_loop(
     mut temp_buffer: String,
     mut cpu_temp_file: std::fs::File,
-    mut gpu_temp_file: Option<std::fs::File>,
+    mut gpu_temp_files: Vec<std::fs::File>,
     fans: &NonEmptyVec<FanController>,
 ) -> Result<()> {
     let cancellation_token = Arc::new(AtomicBool::new(false));
@@ -152,16 +168,13 @@ fn start_temp_loop(
     let mut was_long_sleep = false;
     while !cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
         let cpu_temp = read_temp_file(&mut cpu_temp_file, &mut temp_buffer)?;
-        let temp = if let Some(gpu_temp_file) = &mut gpu_temp_file {
+        let mut temp = cpu_temp;
+        for gpu_temp_file in &mut gpu_temp_files {
             let gpu_temp = read_temp_file(gpu_temp_file, &mut temp_buffer)?;
-            if gpu_temp > cpu_temp {
-                gpu_temp
-            } else {
-                cpu_temp
+            if gpu_temp > temp {
+                temp = gpu_temp;
             }
-        } else {
-            cpu_temp
-        };
+        }
 
         temps.push_back(temp);
         if was_long_sleep {
@@ -202,14 +215,14 @@ fn real_main() -> Result<()> {
     let fan_paths = find_fan_paths()?;
     let fans = load_fan_configs(fan_paths)?;
     let cpu_temp_file = find_cpu_temp_file(&mut temp_buffer)?;
-    let gpu_temp_file = find_gpu_temp_file(&mut temp_buffer)?;
+    let gpu_temp_files = find_gpu_temp_files(&mut temp_buffer)?;
 
     println!();
     for fan in &fans {
         fan.set_manual(true)?;
     }
 
-    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_temp_file, &fans);
+    let res = start_temp_loop(temp_buffer, cpu_temp_file, gpu_temp_files, &fans);
     println!("T2 Fan Daemon is shutting down...");
     for fan in fans {
         fan.set_manual(false)?;
